@@ -331,6 +331,107 @@ def build_flat_tree(
 
 
 @dataclass(frozen=True)
+class CompressedForest:
+    """森林删除一个节点集并按“最近存活祖先”压缩后的完整结论。
+
+    - survivors：删除集之外的全部节点（删除集与森林取交，域外 ID 忽略）；
+    - new_parent_of：每个存活节点压缩后的父指针（跳过被删祖先，无存活
+      祖先则为 None）；
+    - old_root_of：压缩前**全部**森林节点（含被删者）沿旧父指针上溯的根；
+    - new_root_of：每个存活节点在压缩后父指针上的新根。
+
+    保留期清理与批次撤销预演共用这同一套压缩语义。
+    """
+
+    survivors: frozenset[str]
+    new_parent_of: dict[str, Optional[str]]
+    old_root_of: dict[str, str]
+    new_root_of: dict[str, str]
+
+
+def _climb_root_in(
+    parent_of: dict[str, Optional[str]],
+    message_id: str,
+    domain: set[str],
+) -> str:
+    """沿父指针上溯到根；父指针为空、穿出 domain 或遇环时以当前节点收尾。"""
+
+    cur = message_id
+    seen: set[str] = set()
+    while True:
+        pid = parent_of.get(cur)
+        if pid is None or pid not in domain or pid in seen:
+            return cur
+        seen.add(cur)
+        cur = pid
+
+
+def compress_forest(
+    parent_of: dict[str, Optional[str]],
+    delete_set: set[str],
+) -> CompressedForest:
+    """在有效邮件森林上删除 delete_set 并按最近存活祖先压缩（纯函数）。
+
+    存活节点若父节点被删，则沿父链向上跳过全部被删节点，重挂到最近的
+    存活祖先；链顶没有存活祖先时成为新根（父指针置 None）。delete_set
+    中不属于该森林的 ID 会被忽略。
+    """
+
+    valid_ids = set(parent_of)
+    delete_valid = {mid for mid in delete_set if mid in valid_ids}
+    survivors = valid_ids - delete_valid
+
+    # 压缩前旧根：对全部森林节点（含被删者）沿旧父指针上溯
+    old_root_of = {mid: _climb_root_in(parent_of, mid, valid_ids) for mid in valid_ids}
+
+    # 新父：沿父链跳过被删节点，找最近存活祖先；无则成根（None）。
+    # 记忆化：最近存活祖先只取决于父链上更靠上的节点，先把父链节点
+    # 收集起来，再自顶向下回填，保证每个节点只走一遍链。
+    new_parent: dict[str, Optional[str]] = {}
+
+    def resolve(mid: str) -> Optional[str]:
+        if mid in new_parent:
+            return new_parent[mid]
+        chain: list[str] = []
+        cur = mid
+        seen: set[str] = set()
+        # 收集父链直到根、穿出森林、回到已解析节点（防御性：遇环也停）
+        while (
+            cur is not None
+            and cur in valid_ids
+            and cur not in new_parent
+            and cur not in seen
+        ):
+            chain.append(cur)
+            seen.add(cur)
+            cur = parent_of.get(cur)
+        inherited = new_parent.get(cur) if cur is not None else None
+        for node in reversed(chain):
+            pid = parent_of.get(node)
+            if pid is None or pid not in valid_ids:
+                inherited = None
+            elif pid not in delete_valid:
+                inherited = pid
+            # pid 被删 => inherited 保持为已解析出的最近存活祖先
+            new_parent[node] = inherited
+        return new_parent[mid]
+
+    for mid in survivors:
+        resolve(mid)
+
+    new_root_of = {
+        mid: _climb_root_in(new_parent, mid, set(new_parent)) for mid in survivors
+    }
+
+    return CompressedForest(
+        survivors=frozenset(survivors),
+        new_parent_of=new_parent,
+        old_root_of=old_root_of,
+        new_root_of=new_root_of,
+    )
+
+
+@dataclass(frozen=True)
 class CleanupImpact:
     """一个存活节点在压缩前后的父节点 / 根节点。"""
 
@@ -385,79 +486,19 @@ def plan_retention_cleanup(
             protected_expired_ids=frozenset(protected_expired),
         )
 
-    survivors = valid_ids - delete_set
-
-    # 旧根（压缩前）：沿父指针上溯
-    def old_root_of(mid: str) -> str:
-        cur = mid
-        seen: set[str] = set()
-        while True:
-            pid = parent_of.get(cur)
-            if pid is None or pid not in valid_ids or pid in seen:
-                return cur
-            seen.add(cur)
-            cur = pid
-
-    old_root: dict[str, str] = {mid: old_root_of(mid) for mid in survivors}
-
-    # 新父：沿父链跳过被删节点，找最近存活祖先；无则成根（None）。
-    # 记忆化：最近存活祖先只取决于父链上更靠上的节点，先把父链节点
-    # 收集起来，再自顶向下回填，保证每个节点只走一遍链。
-    new_parent: dict[str, Optional[str]] = {}
-
-    def resolve(mid: str) -> Optional[str]:
-        if mid in new_parent:
-            return new_parent[mid]
-        chain: list[str] = []
-        cur = mid
-        seen: set[str] = set()
-        # 收集父链直到根、穿出森林、回到已解析节点（防御性：遇环也停）
-        while (
-            cur is not None
-            and cur in valid_ids
-            and cur not in new_parent
-            and cur not in seen
-        ):
-            chain.append(cur)
-            seen.add(cur)
-            cur = parent_of.get(cur)
-        inherited = new_parent.get(cur) if cur is not None else None
-        for node in reversed(chain):
-            pid = parent_of.get(node)
-            if pid is None or pid not in valid_ids:
-                inherited = None
-            elif pid not in delete_set:
-                inherited = pid
-            # pid 被删 => inherited 保持为已解析出的最近存活祖先
-            new_parent[node] = inherited
-        return new_parent[mid]
-
-    for mid in survivors:
-        resolve(mid)
-
-    # 新根（压缩后）：在新父指针上一次上溯
-    def new_root_of(mid: str) -> str:
-        cur = mid
-        seen: set[str] = set()
-        while True:
-            pid = new_parent.get(cur)
-            if pid is None or pid in seen:
-                return cur
-            seen.add(cur)
-            cur = pid
-
-    new_root: dict[str, str] = {mid: new_root_of(mid) for mid in survivors}
+    forest = compress_forest(parent_of, delete_set)
 
     impacts: list[CleanupImpact] = []
-    for mid in survivors:
-        op, nr = new_parent[mid], new_root[mid]
-        if op != parent_of.get(mid) or nr != old_root[mid]:
+    for mid in forest.survivors:
+        new_pid, new_root = forest.new_parent_of[mid], forest.new_root_of[mid]
+        old_pid, old_root = parent_of.get(mid), forest.old_root_of[mid]
+        if new_pid != old_pid or new_root != old_root:
             impacts.append(CleanupImpact(
                 message_id=mid,
-                old_parent_id=parent_of.get(mid),
-                new_parent_id=op,
-                old_root_id=old_root[mid],
-                new_root_id=nr,
+                old_parent_id=old_pid,
+                new_parent_id=new_pid,
+                old_root_id=old_root,
+                new_root_id=new_root,
             ))
     impacts.sort(key=lambda i: i.message_id)
 
@@ -466,6 +507,97 @@ def plan_retention_cleanup(
         impacts=impacts,
         expired_ids=frozenset(expired_valid),
         protected_expired_ids=frozenset(protected_expired),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 批次撤销预演：按保留期清理的同一套压缩语义模拟删除某批次有效邮件（只读）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RollbackImpact:
+    """撤销压缩中一个存活节点的父节点 / 根节点变化（字段同 CleanupImpact）。"""
+
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: str
+    new_root_id: str
+
+
+@dataclass(frozen=True)
+class BatchRollbackPlan:
+    """一次批次撤销预演的完整结论。
+
+    deleted_ids 与 impacts 均已按 message_id 稳定排序；touched_old_roots
+    为删除集在压缩前所属旧树的根（受撤销触及的旧会话）；touched_survivors
+    为这些旧树中压缩后仍存活的节点（构成撤销后的根分组，对其 new_parent_of
+    子图闭合——每个触及存活节点的新父要么为 None、要么仍是触及存活节点）。
+    """
+
+    deleted_ids: list[str]
+    impacts: list[RollbackImpact]
+    touched_old_roots: frozenset[str]
+    touched_survivors: frozenset[str]
+
+
+def plan_batch_rollback(
+    parent_of: dict[str, Optional[str]],
+    candidate_delete_ids: set[str],
+) -> BatchRollbackPlan:
+    """模拟撤销一个批次：在当前有效森林上删除候选集并压缩（纯函数）。
+
+    候选集由调用方给出——该批次**首次归档且当前仍归属该批次**的有效邮件；
+    快照中的历史祖先（属于更早批次）、环内 invalid 邮件（不在有效森林内）、
+    以及原归档被清理后由更晚批次重用同 ID 的邮件（当前 batch_id 已变更）
+    均不在候选集中。本函数再与有效森林取一次交集做防御性过滤。
+
+    压缩与 ``plan_retention_cleanup`` 共用 ``compress_forest``：存活子孙
+    重挂到最近存活祖先，链顶无存活祖先则提升为新根；撤销不引入保留期 /
+    冻结概念，候选有效邮件一律视为待删除。
+    """
+
+    valid_ids = set(parent_of)
+    delete_set = {mid for mid in candidate_delete_ids if mid in valid_ids}
+    if not delete_set:
+        return BatchRollbackPlan(
+            deleted_ids=[],
+            impacts=[],
+            touched_old_roots=frozenset(),
+            touched_survivors=frozenset(),
+        )
+
+    forest = compress_forest(parent_of, delete_set)
+
+    # 受撤销触及的旧会话：删除集成员压缩前所在的旧根（去重）
+    touched_old_roots = {forest.old_root_of[mid] for mid in delete_set}
+    # 这些旧树中压缩后仍存活的全部节点；未触及的其它会话不参与根分组
+    touched_survivors = {
+        mid
+        for mid in forest.survivors
+        if forest.old_root_of[mid] in touched_old_roots
+    }
+
+    impacts: list[RollbackImpact] = []
+    for mid in touched_survivors:
+        new_pid, new_root = forest.new_parent_of[mid], forest.new_root_of[mid]
+        old_pid, old_root = parent_of.get(mid), forest.old_root_of[mid]
+        if new_pid != old_pid or new_root != old_root:
+            impacts.append(RollbackImpact(
+                message_id=mid,
+                old_parent_id=old_pid,
+                new_parent_id=new_pid,
+                old_root_id=old_root,
+                new_root_id=new_root,
+            ))
+    impacts.sort(key=lambda i: i.message_id)
+
+    return BatchRollbackPlan(
+        deleted_ids=sorted(delete_set),
+        impacts=impacts,
+        touched_old_roots=frozenset(touched_old_roots),
+        touched_survivors=frozenset(touched_survivors),
     )
 
 

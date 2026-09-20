@@ -750,6 +750,151 @@ def audit_batch_drift(batch_id: str) -> Optional[dict]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# POST /batches/{batch_id}/rollback-preview：批次撤销预演（只读）
+# ---------------------------------------------------------------------------
+
+
+def preview_batch_rollback(batch_id: str) -> Optional[dict]:
+    """只读预演撤销某批次首次归档、当前仍归属该批次的有效邮件。
+
+    拟删除集只包含 ``messages.batch_id == 该批次`` 且 ``is_invalid = 0``
+    的当前行，因此天然排除：
+
+    - 快照树中的**历史祖先**（由更早批次归档，batch_id 不同，永不删除）；
+    - 本批归档的**环内 invalid 邮件**（is_invalid = 1，从不参与有效森林）；
+    - **已被更晚批次重用同 ID** 的邮件——原归档被保留期清理删除后由更晚
+      批次重新归档，当前行 batch_id 已指向更晚批次。
+
+    压缩与保留期清理共用 ``threading.plan_batch_rollback``（底层为同一
+    ``compress_forest``）：存活子孙沿父链跳过被删节点、重挂到最近存活
+    祖先，链顶无存活祖先则提升为新根。撤销不引入保留期 / 冻结概念。
+    全程只读：显式只读事务内取一致视图后 rollback，绝不写库；未知批次
+    返回 None（-> 404）。
+    """
+
+    conn = database.connect()
+    try:
+        # 显式只读事务：批次存在性、计数与整幅森林的读取落在同一事务视图
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT result_json FROM batch_results WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+        snapshot = json.loads(row["result_json"])
+        submitted_at = snapshot["submitted_at"]
+
+        # 快照 threads 基线中的全部有效节点（环内 invalid 不在其中）
+        baseline = threading.flatten_snapshot_threads(snapshot["threads"])
+        baseline_ids = [node.message_id for node in baseline]
+
+        # 本批首次归档、当前仍归属本批的有效邮件 => 拟删除集；
+        # 基线中当前行 archived_at 晚于批次时刻者 => 同 ID 已被更晚批次重用。
+        candidate_ids: set[str] = set()
+        reused_ids: set[str] = set()
+        if baseline_ids:
+            placeholders = ",".join("?" * len(baseline_ids))
+            for r in conn.execute(
+                "SELECT message_id, batch_id, archived_at FROM messages "
+                f"WHERE message_id IN ({placeholders})",
+                baseline_ids,
+            ):
+                if r["batch_id"] == batch_id:
+                    candidate_ids.add(r["message_id"])
+                if r["archived_at"] > submitted_at:
+                    reused_ids.add(r["message_id"])
+
+        # 本批归档的环内 invalid 邮件（invalid 行从不参与清理、不会被重用）
+        skipped_invalid = conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE batch_id = ? AND is_invalid = 1",
+            (batch_id,),
+        ).fetchone()["c"]
+
+        # 当前整幅有效邮件森林的父指针（环内 invalid 邮件不在其中）
+        parent_rows = conn.execute(
+            "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+        ).fetchall()
+        current_parent_of: dict[str, Optional[str]] = {
+            r["message_id"]: r["parent_id"] for r in parent_rows
+        }
+
+        plan = threading.plan_batch_rollback(
+            parent_of=current_parent_of,
+            candidate_delete_ids=candidate_ids,
+        )
+
+        # 仅为受触及旧会话的存活节点装载归并/排序所需的完整字段，
+        # 在压缩后父指针上按与 build_flat_tree 相同的稳定排序先序展开，
+        # 再按 depth=0 切分。压缩只会沿同一父链跳过被删祖先、绝不跨树
+        # 挂接，故 touched 存活节点的新父要么为 None、要么仍是同组 touched
+        # 存活节点（子图闭合）。
+        touched = set(plan.touched_survivors)
+        impact_by_id = {impact.message_id: impact for impact in plan.impacts}
+
+        touched_messages: dict[str, ThreadMessage] = {}
+        if touched:
+            placeholders = ",".join("?" * len(touched))
+            for r in conn.execute(
+                "SELECT message_id, in_reply_to, \"references\", sent_at, subject "
+                f"FROM messages WHERE message_id IN ({placeholders})",
+                sorted(touched),
+            ):
+                touched_messages[r["message_id"]] = _row_to_message(r)
+        conn.rollback()
+
+        def new_parent_of(mid: str) -> Optional[str]:
+            impact = impact_by_id.get(mid)
+            return (
+                impact.new_parent_id
+                if impact is not None
+                else current_parent_of[mid]
+            )
+
+        touched_parents = {mid: new_parent_of(mid) for mid in touched}
+        flat = threading.build_flat_tree(touched_messages, touched_parents)
+
+        root_groups: list[dict] = []
+        current: Optional[dict] = None
+        for item in flat:
+            if item["depth"] == 0:
+                current = {"root_id": item["message_id"], "members": []}
+                root_groups.append(current)
+            # 先序展开保证每个节点都在某个 depth=0 的根之后
+            current["members"].append(item["message_id"])  # type: ignore[index]
+        for group in root_groups:
+            group["size"] = len(group["members"])
+
+        return {
+            "batch_id": batch_id,
+            "submitted_at": submitted_at,
+            "deleted_ids": plan.deleted_ids,
+            "affected": [
+                {
+                    "message_id": impact.message_id,
+                    "old_parent_id": impact.old_parent_id,
+                    "new_parent_id": impact.new_parent_id,
+                    "old_root_id": impact.old_root_id,
+                    "new_root_id": impact.new_root_id,
+                }
+                for impact in plan.impacts
+            ],
+            "root_groups": root_groups,
+            "summary": {
+                "deleted_count": len(plan.deleted_ids),
+                "affected_count": len(plan.impacts),
+                "skipped_invalid_count": skipped_invalid,
+                "skipped_reused_count": len(reused_ids),
+                "touched_tree_count": len(plan.touched_old_roots),
+                "root_group_count": len(root_groups),
+                "surviving_count": len(touched),
+            },
+        }
+    finally:
+        conn.close()
+
+
 def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:

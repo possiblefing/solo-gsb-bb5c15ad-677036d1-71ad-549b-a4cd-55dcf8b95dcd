@@ -13,6 +13,7 @@ from .schemas import (
     BatchDriftReport,
     BatchIn,
     BatchResult,
+    BatchRollbackPreview,
     BatchSummary,
     CleanupIn,
     CleanupResult,
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
         "POST /batches 支持 Idempotency-Key 幂等提交（同键同内容重放首次批次响应，"
@@ -51,8 +52,9 @@ app = FastAPI(
         "RFC 2047 编码词）、邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
         "会话响应时限评估（POST /thread-sla/evaluate，只读）、"
-        "会话主题漂移审计（POST /thread-subject-audit，只读），"
-        "以及批次漂移审计（GET /batches/{batch_id}/drift，只读）。"
+        "会话主题漂移审计（POST /thread-subject-audit，只读）、"
+        "批次漂移审计（GET /batches/{batch_id}/drift，只读），"
+        "以及批次撤销预演（POST /batches/{batch_id}/rollback-preview，只读）。"
     ),
     lifespan=lifespan,
 )
@@ -158,6 +160,22 @@ def get_batch(batch_id: str) -> dict:
 )
 def audit_batch_drift(batch_id: str) -> dict:
     result = service.audit_batch_drift(batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return result
+
+
+@app.post(
+    "/batches/{batch_id}/rollback-preview",
+    response_model=BatchRollbackPreview,
+    tags=["batches"],
+    summary=(
+        "批次撤销预演：模拟撤销该批次首次归档且当前仍归属该批次的有效邮件，"
+        "按保留期清理的同一套压缩语义在内存中为重挂存活子孙（只读，不写库）"
+    ),
+)
+def preview_batch_rollback(batch_id: str) -> dict:
+    result = service.preview_batch_rollback(batch_id)
     if result is None:
         raise HTTPException(status_code=404, detail="batch not found")
     return result

@@ -528,3 +528,92 @@ def test_audit_thread_subjects_no_drift_returns_empty_groups():
     audit = audit_thread_subjects(msgs, parent_of)
     assert [i.drifted for i in audit.items] == [False, False]
     assert audit.drift_groups == []
+
+
+# ---------------------------------------------------------------------------
+# plan_batch_rollback：批次撤销预演（纯逻辑，压缩语义同 plan_retention_cleanup）
+# ---------------------------------------------------------------------------
+
+from app.threading import plan_batch_rollback  # noqa: E402
+
+
+def test_rollback_middle_batch_keeps_historical_ancestor_and_relinks_later_descendants():
+    # 历史祖先 H(更早批) -> B/C(拟撤销批) -> D/E(更晚批存活子孙)
+    # H -> B -> D；B -> E
+    parent_of = {"H": None, "B": "H", "C": "H", "D": "B", "E": "B"}
+    plan = plan_batch_rollback(parent_of, candidate_delete_ids={"B", "C"})
+
+    # 历史祖先 H 不在删除集；B/C 待删
+    assert plan.deleted_ids == ["B", "C"]
+    impacts = _impact_map(plan)
+
+    # D/E 越过 B 重挂到最近存活祖先 H，根仍为 H
+    assert (impacts["D"].old_parent_id, impacts["D"].new_parent_id) == ("B", "H")
+    assert (impacts["D"].old_root_id, impacts["D"].new_root_id) == ("H", "H")
+    assert (impacts["E"].old_parent_id, impacts["E"].new_parent_id) == ("B", "H")
+    assert (impacts["E"].old_root_id, impacts["E"].new_root_id) == ("H", "H")
+    # H 存活且无变化，不出现在 impacts
+    assert "H" not in impacts
+
+    # 受触及旧树只有 H 一棵；存活者 H/D/E 均属于该旧树
+    assert plan.touched_old_roots == frozenset({"H"})
+    assert plan.touched_survivors == frozenset({"H", "D", "E"})
+
+
+def test_rollback_first_batch_root_deleted_promotes_chain_to_new_roots():
+    # 撤销首批：R -> A -> C -> E，整链前段被删，C 提升为新根
+    parent_of = {"R": None, "A": "R", "C": "A", "E": "C"}
+    plan = plan_batch_rollback(parent_of, candidate_delete_ids={"R", "A"})
+    assert plan.deleted_ids == ["A", "R"]
+    impacts = _impact_map(plan)
+    # C 越过 A、R，无存活祖先 -> 新根；E 父仍为 C，仅根变化
+    assert (impacts["C"].old_parent_id, impacts["C"].new_parent_id) == ("A", None)
+    assert (impacts["C"].old_root_id, impacts["C"].new_root_id) == ("R", "C")
+    assert "E" in impacts
+    assert (impacts["E"].old_parent_id, impacts["E"].new_parent_id) == ("C", "C")
+    assert (impacts["E"].old_root_id, impacts["E"].new_root_id) == ("R", "C")
+    assert plan.touched_old_roots == frozenset({"R"})
+    assert plan.touched_survivors == frozenset({"C", "E"})
+
+
+def test_rollback_unrelated_threads_are_not_touched():
+    # 撤销 P/Q 所在批次；另一棵完全无关的树 R -> S 不触及、不入根分组
+    parent_of = {"P": None, "Q": "P", "R": None, "S": "R"}
+    plan = plan_batch_rollback(parent_of, candidate_delete_ids={"P", "Q"})
+    assert plan.deleted_ids == ["P", "Q"]
+    assert plan.impacts == []
+    assert plan.touched_old_roots == frozenset({"P"})
+    assert plan.touched_survivors == frozenset()
+
+
+def test_rollback_deleting_whole_tree_leaves_no_survivors_or_impacts():
+    parent_of = {"R": None, "A": "R", "B": "A"}
+    plan = plan_batch_rollback(parent_of, candidate_delete_ids={"R", "A", "B"})
+    assert plan.deleted_ids == ["A", "B", "R"]
+    assert plan.impacts == []
+    assert plan.touched_old_roots == frozenset({"R"})
+    assert plan.touched_survivors == frozenset()
+
+
+def test_rollback_empty_and_foreign_candidates_is_noop():
+    parent_of = {"R": None, "A": "R"}
+    plan = plan_batch_rollback(parent_of, candidate_delete_ids={"ghost", "ghost2"})
+    assert plan.deleted_ids == []
+    assert plan.impacts == []
+    assert plan.touched_old_roots == frozenset()
+    assert plan.touched_survivors == frozenset()
+
+
+def test_rollback_matches_cleanup_compression_for_same_delete_set():
+    # 同一删除集下，撤销预演与保留期清理的压缩结论必须逐字段一致
+    parent_of = {"R": None, "B": "R", "C": "B", "D": "C", "E": "D"}
+    rb = plan_batch_rollback(parent_of, candidate_delete_ids={"B", "C"})
+    cu = plan_retention_cleanup(
+        parent_of, expired_ids={"B", "C"}, protected_ids=set()
+    )
+    assert rb.deleted_ids == cu.deleted_ids
+    assert [(i.message_id, i.old_parent_id, i.new_parent_id, i.old_root_id,
+             i.new_root_id) for i in rb.impacts] == [
+        (i.message_id, i.old_parent_id, i.new_parent_id, i.old_root_id,
+         i.new_root_id) for i in cu.impacts
+    ]

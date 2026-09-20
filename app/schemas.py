@@ -537,4 +537,74 @@ class BatchDriftReport(BaseModel):
     summary: BatchDriftSummary = Field(..., description="按状态分类的计数汇总")
 
 
+# ---------------------------------------------------------------------------
+# 批次撤销预演
+# ---------------------------------------------------------------------------
+
+
+class RollbackItem(BaseModel):
+    """撤销压缩后父节点或根节点发生变化的存活邮件。"""
+
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: str
+    new_root_id: str
+
+
+class RollbackRootGroup(BaseModel):
+    """撤销后由同一新根统领的一组存活邮件（仅含受撤销触及的旧会话）。"""
+
+    root_id: str = Field(..., description="压缩后的新根 ID")
+    size: int = Field(..., description="该分组（含新根本身）的邮件数")
+    members: list[str] = Field(
+        ..., description="组内全部邮件 ID，按撤销后结构的稳定先序排列"
+    )
+
+
+class RollbackSummary(BaseModel):
+    """撤销预演计数汇总。"""
+
+    deleted_count: int = Field(..., description="拟删除邮件数（本批首次归档且当前仍归属本批的有效邮件）")
+    affected_count: int = Field(..., description="存活但父节点或根节点将变化的邮件数")
+    skipped_invalid_count: int = Field(
+        ..., description="本批归档的环内 invalid 邮件数（撤销不处理）"
+    )
+    skipped_reused_count: int = Field(
+        ...,
+        description=(
+            "本批首次归档但当前已不归属本批的邮件数——原归档已被保留期清理删除、"
+            "同 ID 由更晚批次重用（撤销不处理）"
+        ),
+    )
+    touched_tree_count: int = Field(
+        ..., description="撤销触及的旧会话树数量（删除集成员压缩前所属旧根去重）"
+    )
+    root_group_count: int = Field(..., description="撤销后的根分组数量")
+    surviving_count: int = Field(
+        ..., description="受触及旧会话中撤销后仍存活的邮件数（根分组成员总数）"
+    )
+
+
+class BatchRollbackPreview(BaseModel):
+    """POST /batches/{batch_id}/rollback-preview：批次撤销预演结论。"""
+
+    batch_id: str
+    submitted_at: datetime = Field(..., description="拟撤销批次的归档时间，UTC")
+    deleted_ids: list[str] = Field(
+        ..., description="拟删除的邮件 ID（本批有效、当前仍归属本批），升序"
+    )
+    affected: list[RollbackItem] = Field(
+        ..., description="存活但父节点或根节点将变化的邮件，按 message_id 升序"
+    )
+    root_groups: list[RollbackRootGroup] = Field(
+        ...,
+        description=(
+            "撤销后的根分组：仅覆盖受撤销触及旧会话的存活子孙，按新根的"
+            "稳定顺序（sent_at, message_id）排列，组内成员按撤销后先序排列"
+        ),
+    )
+    summary: RollbackSummary = Field(..., description="计数汇总")
+
+
 TreeNode.model_rebuild()

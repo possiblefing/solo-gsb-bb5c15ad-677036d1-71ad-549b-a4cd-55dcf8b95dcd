@@ -17,7 +17,11 @@
 只读地按分支基线逐节点判定主题漂移并归并连续偏离分组）。
 另有**批次漂移审计**（`GET /batches/{batch_id}/drift`）：以批次不可变快照中的
 原始会话树为基线，只读地逐封判定 `deleted` / `id_reused` / `reparented` /
-`root_changed` / `unchanged` 并返回各状态计数。
+`root_changed` / `unchanged` 并返回各状态计数；
+以及**批次撤销预演**（`POST /batches/{batch_id}/rollback-preview`）：只读模拟
+撤销某批次首次归档且当前仍归属该批次的有效邮件，按保留期清理的同一套压缩语义
+在内存中为存活子孙寻找最近存活祖先，返回待删除 ID、父节点将变化的邮件、
+撤销后的根分组与汇总（不写库）。
 
 ## 一条命令启动
 
@@ -63,6 +67,7 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `GET` | `/batches/{batch_id}/drift` | **批次漂移审计**：以该批次快照的原始会话树为基线，只读逐封判定 `deleted` / `id_reused` / `reparented` / `root_changed` / `unchanged` 并返回各状态计数 |
+| `POST` | `/batches/{batch_id}/rollback-preview` | **批次撤销预演（只读）**：模拟撤销该批次首次归档且当前仍归属该批次的有效邮件，按保留期清理的同一套压缩语义为存活子孙重挂最近存活祖先，返回待删除 ID、父节点将变化的邮件、撤销后的根分组与汇总；未知批次 **404** |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `POST` | `/thread-corrections` | **人工会话纠偏**：调整一封有效邮件的父节点（`null` 拆成根），带 revision 乐观校验（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
@@ -79,7 +84,7 @@ ports:
 `retain_until` 早于或等于清理 `cutoff` 即视为到期。环内 `invalid` 邮件
 不参与冻结与清理。
 
-未知 ID：批次查询与批次漂移审计、邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+未知 ID：批次查询、批次漂移审计、**批次撤销预演**、邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /batches` 的 `Idempotency-Key` 格式非法（空值 / 含空白 / 非可见 ASCII /
@@ -632,6 +637,68 @@ curl http://localhost:8000/batches/<batch_id>/drift
 }
 ```
 
+### 批次撤销预演：`POST /batches/{batch_id}/rollback-preview`
+
+在**不写库**的前提下，模拟“撤销”一个批次：删除该批次**首次归档且当前仍归属
+该批次的有效邮件**，并在内存中按与保留期清理**完全相同的压缩语义**为存活子孙
+寻找最近存活祖先。接口**只读**，可重复调用、结论幂等；未知批次返回 **404**。
+
+- **拟删除范围**（`deleted_ids`，升序）：仅当前 `messages` 表中
+  `batch_id == 该批次` 且为有效（非环内 `invalid`）的邮件。以下三类**不处理**：
+  1. 快照树中的**历史祖先**——由更早批次归档（`batch_id` 不同），撤销本批时
+     它们继续作为存活祖先保留；
+  2. 本批归档的**环内 invalid 邮件**——从不参与有效会话森林（计入
+     `summary.skipped_invalid_count`）；
+  3. **已被更晚批次重用的同 ID**——原归档已被保留期清理删除、同 ID 由更晚批次
+     重新归档（当前行 `batch_id` 已变更），撤销不得误删新归档（计入
+     `summary.skipped_reused_count`）；
+- **压缩**（与 `POST /retention/cleanups` 共用同一纯函数实现）：存活节点若父
+  节点被删，则沿父链跳过全部被删节点重挂到**最近存活祖先**；链顶没有存活祖先
+  时**成为新根**。撤销不引入保留期 / 冻结概念——候选有效邮件一律视为待删除，
+  冻结保护不影响预演结论；
+- `affected`：父节点或根节点**将变化**的存活邮件，逐封给出
+  `old_parent_id` / `new_parent_id` / `old_root_id` / `new_root_id`，按
+  `message_id` 升序（祖先链中间被删只改父指针；根被删时整棵剩余子树的根随之改变）；
+- `root_groups`：**撤销后的根分组**，只覆盖受撤销触及旧会话的存活子孙（完全
+  无关的其它会话不出现）；组按新根的稳定顺序 `(sent_at, message_id)` 排列，
+  组内 `members` 按撤销后结构稳定先序排列，并给出组大小 `size`；
+- `summary`：`deleted_count`（拟删除数）、`affected_count`（父/根将变化数）、
+  `skipped_invalid_count` / `skipped_reused_count`（上面两类跳过数）、
+  `touched_tree_count`（删除集压缩前所属旧会话树去重数）、
+  `root_group_count`（撤销后根分组数）、`surviving_count`（受触及旧会话中
+  撤销后仍存活的邮件数，即各分组成员总数）。
+
+```bash
+curl -X POST http://localhost:8000/batches/<batch_id>/rollback-preview
+```
+
+对上例（拟撤销批次拥有 `B`/`C`，更早批次归档了历史祖先 `H`，更晚批次归档了
+`D`/`E`；当前结构 `H -> B -> C -> D`、`H -> B -> E`）：
+
+```jsonc
+{
+  "batch_id": "…",
+  "submitted_at": "2026-09-18T08:00:00+00:00",
+  "deleted_ids": ["B", "C"],        // 仅本批当前仍归属本批的有效邮件
+  "affected": [                     // 存活子孙重挂到最近存活祖先 H
+    {"message_id": "D", "old_parent_id": "C", "new_parent_id": "H",
+     "old_root_id": "H", "new_root_id": "H"},
+    {"message_id": "E", "old_parent_id": "B", "new_parent_id": "H",
+     "old_root_id": "H", "new_root_id": "H"}
+  ],
+  "root_groups": [                  // 撤销后：H 为唯一新根
+    {"root_id": "H", "size": 3, "members": ["H", "D", "E"]}
+  ],
+  "summary": {"deleted_count": 2, "affected_count": 2,
+              "skipped_invalid_count": 0, "skipped_reused_count": 0,
+              "touched_tree_count": 1, "root_group_count": 1, "surviving_count": 3}
+}
+```
+
+预演**绝不写库**：批次快照、诊断明细、`messages` 表（父指针、`retain_until`、
+`batch_id` 等）与会话冻结状态在调用前后完全一致；本服务也不提供真正执行撤销
+的接口。
+
 ## 保留期：冻结与到期清理
 
 归档时可给邮件设置可选的 `retain_until`（保留截止时间）：
@@ -722,7 +789,8 @@ curl -X POST http://localhost:8000/retention/unfreezes \
   `dry_run` 与实际执行在**同一事务视图**中用同一算法展开保护集合，结论一致；
 - 未设置 `retain_until` 的邮件永不因到期被删；环内 `invalid` 邮件从不参与；
 - **会话压缩**：删除节点后，仍保留的后代沿父链跳过全部被删节点，重挂到
-  **最近的保留祖先**；链顶没有存活祖先时**成为新根**；
+  **最近的保留祖先**；链顶没有存活祖先时**成为新根**（同一套压缩算法也被
+  `POST /batches/{batch_id}/rollback-preview` 用于批次撤销预演）；
 - 响应返回删除 ID（`deleted_ids`）以及每个受影响存活节点的
   `old_parent_id` / `new_parent_id` / `old_root_id` / `new_root_id`
   （祖先链中间被删只改父指针；根被删时整棵剩余子树的根随之改变）；
