@@ -470,6 +470,90 @@ def plan_retention_cleanup(
 
 
 # ---------------------------------------------------------------------------
+# 批次撤销预演：模拟删除一批邮件并按保留期清理语义压缩（纯逻辑，只读）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RollbackRootGroup:
+    """撤销后同一棵会话的存活成员分组（members 按 message_id 升序）。"""
+
+    root_id: str
+    members: list[str]
+
+
+@dataclass(frozen=True)
+class BatchRollbackPlan:
+    """一次批次撤销预演的完整结论。
+
+    deleted_ids 与 impacts 语义同 RetentionCleanupPlan（同一套压缩算法）；
+    root_groups 为撤销后整幅存活森林按新根的分组，组间按 root_id 升序。
+    """
+
+    deleted_ids: list[str]
+    impacts: list[CleanupImpact]
+    root_groups: list[RollbackRootGroup]
+    summary: dict[str, int]
+
+
+def _climb_root_of(message_id: str, parent_of: dict[str, Optional[str]]) -> str:
+    """在内存父指针图上向上爬到根（遇缺失或环时回退为当前节点，防御性）。"""
+
+    cur = message_id
+    seen: set[str] = set()
+    while True:
+        pid = parent_of.get(cur)
+        if pid is None or pid in seen:
+            return cur
+        seen.add(cur)
+        cur = pid
+
+
+def plan_batch_rollback(
+    parent_of: dict[str, Optional[str]],
+    delete_ids: set[str],
+) -> BatchRollbackPlan:
+    """模拟从当前有效邮件森林删除 delete_ids 并按清理压缩语义重挂（纯函数）。
+
+    压缩语义与 plan_retention_cleanup 完全一致（删除集之外全部存活、存活
+    子孙沿父链重挂最近存活祖先、链顶无存活祖先时成为新根），因此直接复用
+    其结论；在此基础上把撤销后的整幅存活森林按新根分组。入参 parent_of
+    只含有效邮件；delete_ids 中不在森林内的 ID 会被忽略。
+    """
+
+    plan = plan_retention_cleanup(parent_of, delete_ids, protected_ids=set())
+
+    # 撤销后的父指针图：存活节点沿用旧父指针，受影响节点换成压缩后的新父
+    deleted = set(plan.deleted_ids)
+    new_parent: dict[str, Optional[str]] = {
+        mid: pid for mid, pid in parent_of.items() if mid not in deleted
+    }
+    for impact in plan.impacts:
+        new_parent[impact.message_id] = impact.new_parent_id
+
+    groups: dict[str, list[str]] = {}
+    for mid in new_parent:
+        groups.setdefault(_climb_root_of(mid, new_parent), []).append(mid)
+    root_groups = [
+        RollbackRootGroup(root_id=root_id, members=sorted(members))
+        for root_id, members in sorted(groups.items())
+    ]
+
+    return BatchRollbackPlan(
+        deleted_ids=plan.deleted_ids,
+        impacts=plan.impacts,
+        root_groups=root_groups,
+        summary={
+            "total": len(parent_of),
+            "deleted": len(plan.deleted_ids),
+            "surviving": len(new_parent),
+            "affected": len(plan.impacts),
+            "roots": len(root_groups),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # 会话响应时限（SLA）评估：纯逻辑，只读
 # ---------------------------------------------------------------------------
 

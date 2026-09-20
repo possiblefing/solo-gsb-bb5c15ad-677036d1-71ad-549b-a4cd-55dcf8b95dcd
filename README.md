@@ -17,7 +17,10 @@
 只读地按分支基线逐节点判定主题漂移并归并连续偏离分组）。
 另有**批次漂移审计**（`GET /batches/{batch_id}/drift`）：以批次不可变快照中的
 原始会话树为基线，只读地逐封判定 `deleted` / `id_reused` / `reparented` /
-`root_changed` / `unchanged` 并返回各状态计数。
+`root_changed` / `unchanged` 并返回各状态计数。以及**批次撤销预演**
+（`POST /batches/{batch_id}/rollback-preview`）：只读地模拟撤销该批次首次归档
+且当前仍归属该批次的有效邮件，按保留期清理的压缩语义为存活子孙重挂最近存活
+祖先，返回待删除 ID、受影响邮件、撤销后的根分组与汇总；预演不写库。
 
 ## 一条命令启动
 
@@ -63,6 +66,7 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `GET` | `/batches/{batch_id}/drift` | **批次漂移审计**：以该批次快照的原始会话树为基线，只读逐封判定 `deleted` / `id_reused` / `reparented` / `root_changed` / `unchanged` 并返回各状态计数 |
+| `POST` | `/batches/{batch_id}/rollback-preview` | **批次撤销预演**：只读模拟撤销该批次首次归档且仍归属该批次的有效邮件，按清理压缩语义返回待删除 ID、受影响邮件、撤销后的根分组与汇总（不写库） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
 | `POST` | `/thread-corrections` | **人工会话纠偏**：调整一封有效邮件的父节点（`null` 拆成根），带 revision 乐观校验（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
@@ -79,7 +83,7 @@ ports:
 `retain_until` 早于或等于清理 `cutoff` 即视为到期。环内 `invalid` 邮件
 不参与冻结与清理。
 
-未知 ID：批次查询与批次漂移审计、邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+未知 ID：批次查询、批次漂移审计与批次撤销预演、邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /batches` 的 `Idempotency-Key` 格式非法（空值 / 含空白 / 非可见 ASCII /
@@ -629,6 +633,53 @@ curl http://localhost:8000/batches/<batch_id>/drift
   ],
   "summary": {"total": 3, "deleted": 1, "id_reused": 0,
               "reparented": 1, "root_changed": 1, "unchanged": 0}
+}
+```
+
+### 批次撤销预演：`POST /batches/{batch_id}/rollback-preview`
+
+只读预演「撤销该批次的首次归档」：模拟删除**该批次首次归档且当前仍归属该
+批次的有效邮件**，并按保留期清理的压缩语义在内存中为存活子孙重挂最近存活
+祖先。接口**只读**：不写库、不改写批次快照与诊断明细；未知批次返回 **404**。
+
+- **删除集**：当前归档中 `batch_id` 为该批次且有效的邮件。快照 `threads`
+  中的**历史祖先**（归属更早批次）、环内 `invalid` 邮件、以及原归档被清理
+  后**由更晚批次重归档的同 ID** 均不参与撤销；
+- **压缩语义**：与 `POST /retention/cleanups` 完全一致——存活节点沿父链
+  跳过全部被删节点，重挂到**最近的存活祖先**；链顶没有存活祖先时成为新根。
+  全部计算在内存中进行，基于当前拓扑（补链 / 纠偏 / 清理压缩后的父指针），
+  预演本身不改动任何数据；
+- **响应**：`deleted_ids`（待删除 ID，升序）、`affected`（存活但父节点或
+  根节点将变化的邮件，含变化前后的父/根，按 `message_id` 升序）、
+  `root_groups`（撤销后存活森林按新根的分组，成员按 `message_id` 升序）
+  与 `summary` 计数汇总（`total` = 当前有效邮件总数 = `deleted` +
+  `surviving`）。
+
+服务监听 **8000** 端口：
+
+```bash
+curl -X POST http://localhost:8000/batches/<batch_id>/rollback-preview
+```
+
+```jsonc
+{
+  "batch_id": "…",
+  "submitted_at": "2026-09-18T08:00:00+00:00",   // 批次归档时间
+  "deleted_ids": ["A", "R"],          // 该批次首次归档且仍归属它的有效邮件
+  "affected": [                        // 存活但父/根将变化（按 message_id 升序）
+    {"message_id": "C", "old_parent_id": "A", "new_parent_id": null,
+     "old_root_id": "R", "new_root_id": "C"},
+    {"message_id": "D", "old_parent_id": "R", "new_parent_id": null,
+     "old_root_id": "R", "new_root_id": "D"},
+    {"message_id": "E", "old_parent_id": "C", "new_parent_id": "C",
+     "old_root_id": "R", "new_root_id": "C"}
+  ],
+  "root_groups": [                     // 撤销后存活森林按新根分组
+    {"root_id": "C", "members": ["C", "E"]},
+    {"root_id": "D", "members": ["D"]}
+  ],
+  "summary": {"total": 5, "deleted": 2, "surviving": 3,
+              "affected": 3, "roots": 2}
 }
 ```
 

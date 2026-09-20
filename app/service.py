@@ -750,6 +750,73 @@ def audit_batch_drift(batch_id: str) -> Optional[dict]:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# POST /batches/{batch_id}/rollback-preview：批次撤销预演（只读）
+# ---------------------------------------------------------------------------
+
+
+def preview_batch_rollback(batch_id: str) -> Optional[dict]:
+    """只读预演撤销某批次的首次归档（不写库、不改写批次快照与诊断明细）。
+
+    删除集 = 当前 messages 表中 batch_id 为该批次且有效的邮件，即该批次
+    首次归档且当前仍归属该批次的有效邮件；快照 threads 中的历史祖先
+    （归属更早批次）、环内 invalid 邮件、以及原归档被清理后由更晚批次
+    重归档的同 ID 均不参与。压缩语义与保留期清理一致：存活子孙在内存
+    中重挂最近存活祖先，链顶无存活祖先时成为新根。未知批次返回 None
+    （-> 404）。
+    """
+
+    conn = database.connect()
+    try:
+        # 显式只读事务：批次存在性、删除集与整幅森林读取落在同一事务视图
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT submitted_at FROM batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+
+        parent_of: dict[str, Optional[str]] = {
+            r["message_id"]: r["parent_id"]
+            for r in conn.execute(
+                "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+            )
+        }
+        delete_ids = {
+            r["message_id"]
+            for r in conn.execute(
+                "SELECT message_id FROM messages "
+                "WHERE batch_id = ? AND is_invalid = 0",
+                (batch_id,),
+            )
+        }
+        plan = threading.plan_batch_rollback(parent_of, delete_ids)
+        conn.rollback()
+        return {
+            "batch_id": batch_id,
+            "submitted_at": row["submitted_at"],
+            "deleted_ids": plan.deleted_ids,
+            "affected": [
+                {
+                    "message_id": impact.message_id,
+                    "old_parent_id": impact.old_parent_id,
+                    "new_parent_id": impact.new_parent_id,
+                    "old_root_id": impact.old_root_id,
+                    "new_root_id": impact.new_root_id,
+                }
+                for impact in plan.impacts
+            ],
+            "root_groups": [
+                {"root_id": group.root_id, "members": group.members}
+                for group in plan.root_groups
+            ],
+            "summary": plan.summary,
+        }
+    finally:
+        conn.close()
+
+
 def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:

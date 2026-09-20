@@ -537,4 +537,45 @@ class BatchDriftReport(BaseModel):
     summary: BatchDriftSummary = Field(..., description="按状态分类的计数汇总")
 
 
+# ---------------------------------------------------------------------------
+# 批次撤销预演
+# ---------------------------------------------------------------------------
+
+
+class RollbackRootGroupOut(BaseModel):
+    """撤销后同一棵会话的存活成员分组。"""
+
+    root_id: str = Field(..., description="撤销后该棵会话的根节点 ID")
+    members: list[str] = Field(
+        ..., description="该根下的全部存活邮件 ID，按 message_id 升序"
+    )
+
+
+class BatchRollbackSummary(BaseModel):
+    total: int = Field(..., description="当前归档中有效邮件总数（待删除 + 存活）")
+    deleted: int = Field(..., description="本次预演将删除的邮件数")
+    surviving: int = Field(..., description="撤销后仍存活的有效邮件数")
+    affected: int = Field(..., description="父节点或根节点将变化的存活邮件数")
+    roots: int = Field(..., description="撤销后存活森林的会话树（根）数量")
+
+
+class BatchRollbackPreview(BaseModel):
+    """POST /batches/{batch_id}/rollback-preview：批次撤销预演结论（只读）。"""
+
+    batch_id: str
+    submitted_at: datetime = Field(..., description="批次归档时间，UTC")
+    deleted_ids: list[str] = Field(
+        ...,
+        description="将被删除的邮件 ID（该批次首次归档且当前仍归属该批次的有效邮件），升序",
+    )
+    affected: list[CleanupItem] = Field(
+        ...,
+        description="存活但父节点或根节点将变化的邮件（与保留期清理压缩同一语义），按 message_id 升序",
+    )
+    root_groups: list[RollbackRootGroupOut] = Field(
+        ..., description="撤销后存活森林按新根的分组，组间按 root_id 升序"
+    )
+    summary: BatchRollbackSummary = Field(..., description="计数汇总")
+
+
 TreeNode.model_rebuild()
